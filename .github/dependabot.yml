@@ -1,16 +1,455 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
-# https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
+#!/usr/bin/env bash
+set -euo pipefail
 
+# =========================
+# CONFIG
+# =========================
+OWNER="etsomni-cpu"
+REPO="${1:-}"
+if [[ -z "$REPO" ]]; then
+  echo "Usage: $0 <repo-name>" >&2
+  exit 1
+fi
+
+FEATURE_BRANCH="chore/security-crypto-bootstrap"
+MAKE_PRIVATE="false"   # Set to "true" to make repo private
+REQUIRE_SECRET_CHECK="false"  # If true, add secret scan check to required status checks
+
+# =========================
+# DEPS
+# =========================
+need() { command -v "$1" >/dev/null 2>&1 || { echo "[err] Missing dependency: $1" >&2; exit 1; }; }
+need gh
+need jq
+need base64
+
+say() { printf "\n\033[1m==> %s\033[0m\n" "$*"; }
+warn() { printf "\033[33m[warn]\033[0m %s\n" "$*" >&2; }
+
+# =========================
+# REPO INFO
+# =========================
+say "Checking repository $OWNER/$REPO ..."
+gh repo view "$OWNER/$REPO" >/dev/null
+
+DEFAULT_BRANCH=$(gh repo view "$OWNER/$REPO" --json defaultBranchRef -q .defaultBranchRef.name)
+VISIBILITY=$(gh repo view "$OWNER/$REPO" --json visibility -q .visibility | tr '[:upper:]' '[:lower:]')
+IS_PUBLIC="false"; [[ "$VISIBILITY" == "public" ]] && IS_PUBLIC="true"
+
+# Get default branch HEAD SHA
+HEAD_SHA=$(gh api "repos/$OWNER/$REPO/git/ref/heads/$DEFAULT_BRANCH" --jq .object.sha)
+
+# Create feature branch ref if not exists
+if gh api "repos/$OWNER/$REPO/git/ref/heads/$FEATURE_BRANCH" >/dev/null 2>&1; then
+  say "Branch '$FEATURE_BRANCH' already exists."
+else
+  say "Creating branch '$FEATURE_BRANCH' from $DEFAULT_BRANCH ..."
+  gh api -X POST "repos/$OWNER/$REPO/git/refs" \
+    -f ref="refs/heads/$FEATURE_BRANCH" \
+    -f sha="$HEAD_SHA" >/dev/null
+fi
+
+# Helper: create or update a file on the feature branch
+put_file() {
+  local path="$1"
+  local message="$2"
+  local content="$3"
+
+  # Base64 content (portable)
+  local b64
+  b64=$(printf "%s" "$content" | base64 | tr -d '\n')
+
+  # Check if file exists to include sha for update
+  local sha=""
+  if gh api "repos/$OWNER/$REPO/contents/$path?ref=$FEATURE_BRANCH" >/dev/null 2>&1; then
+    sha=$(gh api "repos/$OWNER/$REPO/contents/$path?ref=$FEATURE_BRANCH" --jq .sha)
+  fi
+
+  say "Upserting $path"
+  if [[ -n "$sha" ]]; then
+    gh api -X PUT "repos/$OWNER/$REPO/contents/$path" \
+      -f message="$message" \
+      -f content="$b64" \
+      -f branch="$FEATURE_BRANCH" \
+      -f sha="$sha" >/dev/null
+  else
+    gh api -X PUT "repos/$OWNER/$REPO/contents/$path" \
+      -f message="$message" \
+      -f content="$b64" \
+      -f branch="$FEATURE_BRANCH" >/dev/null
+  fi
+}
+
+# =========================
+# CONTENTS
+# =========================
+SECURITY_MD=$(cat <<'EOF'
+# Security Policy
+
+- Report vulnerabilities via GitHub Security Advisories:
+  - Create a draft advisory: https://github.com/OWNER/REPO/security/advisories/new
+- Do not open public issues for security problems.
+- Response target: within 3 business days.
+
+## Supported Versions
+We generally support the latest minor release.
+
+## Crypto Safety
+- Never commit private keys, seed phrases (BIP-39), WIF keys, keystores, or RPC credentials.
+- Prefer environment-level secrets and hardware wallets for production signing.
+EOF
+)
+SECURITY_MD="${SECURITY_MD//OWNER\/REPO/$OWNER\/$REPO}"
+
+PRIVACY_MD=$(cat <<'EOF'
+# Privacy Policy
+
+This project does not intentionally collect personal data.
+
+## No Data Sharing
+- We do not sell, rent, or share personal data with third parties.
+- We do not include advertising or analytics trackers.
+- No telemetry is collected. If a dependency enables telemetry, it must be disabled by default and documented with opt-out.
+
+If you discover any privacy concerns (e.g., telemetry in a dependency), please open a private security advisory.
+EOF
+)
+
+CODEOWNERS="* @${OWNER}
+"
+
+GITIGNORE=$(cat <<'EOF'
+# Node/Python/Go basics
+node_modules/
+dist/
+build/
+__pycache__/
+*.pyc
+
+# Wallets/keys/keystores
+*.key
+*.pem
+*.p12
+*.pk8
+*.keystore
+keystore*/
+wallet*/
+secret*/
+secrets*/
+*.secrets.*
+*.env
+.env*
+.env.*.local
+*.age
+*.asc
+*.gpg
+*.json.key
+
+# Local test artifacts
+*.log
+.dump
+*.sqlite
+*.db
+coverage/
+EOF
+)
+
+DEPENDABOT_YML=$(cat <<'EOF'
 version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
-    schedule:
-      interval: "weekly"
+    schedule: { interval: "daily", time: "04:00", timezone: "UTC" }
+    labels: ["dependencies","github-actions"]
+    open-pull-requests-limit: 10
+    groups:
+      actions-minor-patch:
+        applies-to: version-updates
+        update-types: ["minor","patch"]
+        patterns: ["*"]
 
-  - package-ecosystem: "gomod"
+  - package-ecosystem: "npm"
     directory: "/"
-    schedule:
-      interval: "weekly"
+    schedule: { interval: "weekly", day: "monday", time: "04:00", timezone: "UTC" }
+    labels: ["dependencies","javascript"]
+    open-pull-requests-limit: 10
+    groups:
+      npm-minor-patch:
+        applies-to: version-updates
+        update-types: ["minor","patch"]
+        patterns: ["*"]
+
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule: { interval: "weekly", day: "tuesday", time: "04:00", timezone: "UTC" }
+    labels: ["dependencies","python"]
+    open-pull-requests-limit: 10
+    groups:
+      pip-minor-patch:
+        applies-to: version-updates
+        update-types: ["minor","patch"]
+        patterns: ["*"]
+EOF
+)
+
+GITLEAKS_TOML=$(cat <<'EOF'
+title = "Crypto/Wallet Secret Detection"
+
+[allowlist]
+paths = [
+  '''package-lock\.json''',
+  '''yarn\.lock''',
+  '''pnpm-lock\.yaml''',
+  '''poetry\.lock''',
+  '''Cargo\.lock''',
+  '''go\.sum'''
+]
+
+[[rules]]
+id = "ethereum-private-key"
+description = "Ethereum/EVM private key (64-hex)"
+regex = '''(?i)\b(?:0x)?[a-f0-9]{64}\b'''
+keywords = ["private key","ethereum","eth","wallet","secret"]
+tags = ["crypto","evm"]
+[[rules.denylist]]
+description = "Require nearby keyword"
+regex = '''(?is).{0,64}(private[\s_-]?key|ethereum|eth|wallet|secret).{0,64}'''
+
+[[rules]]
+id = "bitcoin-wif"
+description = "Bitcoin WIF private key"
+regex = '''(?x)\b(5[1-9A-HJ-NP-Za-km-z]{50}|[KL][1-9A-HJ-NP-Za-km-z]{51})\b'''
+keywords = ["wif","bitcoin","btc","private key","wallet"]
+tags = ["crypto","btc"]
+
+[[rules]]
+id = "bip39-mnemonic"
+description = "BIP-39 seed phrase (12-24 words)"
+regex = '''(?is)\b([a-z]{3,}\s+){11,23}[a-z]{3,}\b'''
+keywords = ["mnemonic","seed phrase","recovery phrase","bip-39","bip39"]
+tags = ["crypto","wallet","seed"]
+[[rules.denylist]]
+regex = '''(?is)(mnemonic|seed phrase|recovery phrase|bip-?39)'''
+
+[[rules]]
+id = "solana-secret-array"
+description = "Solana secret key array"
+regex = '''(?is)"?secret(_?key)?"?\s*:\s*\[\s*(?:\d{1,3}\s*,\s*){63}\d{1,3}\s*\]'''
+keywords = ["solana","secret","keypair","private"]
+tags = ["crypto","sol"]
+
+[[rules]]
+id = "pem-private-key"
+description = "PEM formatted private key"
+regex = '''-----BEGIN(?:\s\w+)? PRIVATE KEY-----[\s\S]+?-----END(?:\s\w+)? PRIVATE KEY-----'''
+keywords = ["private key","pem"]
+tags = ["generic","pem"]
+
+[[rules]]
+id = "walletconnect-project-id"
+description = "WalletConnect project id (UUIDv4)"
+regex = '''(?i)\b[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}\b'''
+keywords = ["WALLETCONNECT_PROJECT_ID","walletconnect"]
+tags = ["infra"]
+[[rules.denylist]]
+regex = '''(?i)WALLETCONNECT_PROJECT_ID'''
+
+[[rules]]
+id = "env-secrets-crypto"
+description = "Sensitive env var names typical in crypto"
+regex = '''(?i)\b(A(LCHEMY|NKR)|INFURA|PRIVATE[_-]?KEY|MNEMONIC|SEED[_-]?PHRASE|SECRET|API[_-]?KEY|RPC[_-]?URL)\b\s*[=:]\s*.+'''
+keywords = ["private_key","mnemonic","seed","rpc","api_key"]
+tags = ["env","crypto"]
+EOF
+)
+
+CODEQL_YML=$(cat <<EOF
+name: "CodeQL"
+
+on:
+  push:
+    branches: [ "$DEFAULT_BRANCH" ]
+  pull_request:
+    branches: [ "$DEFAULT_BRANCH" ]
+  schedule:
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ["javascript-typescript","python","go"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: \${{ matrix.language }}
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:\${{ matrix.language }}"
+EOF
+)
+
+SECRET_SCAN_YML=$(cat <<'EOF'
+name: "Secret Scan (Gitleaks)"
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Gitleaks Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: detect --no-banner --redact --config=.gitleaks.toml --verbose
+EOF
+)
+
+SCORECARD_YML=$(cat <<'EOF'
+name: "OpenSSF Scorecard"
+on:
+  schedule:
+    - cron: '37 1 * * 5'
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+  id-token: write
+
+jobs:
+  analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+EOF
+)
+
+# =========================
+# UPSERT FILES VIA API
+# =========================
+put_file "SECURITY.md" "chore(security): add SECURITY.md" "$SECURITY_MD"
+put_file "PRIVACY.md" "chore(security): add PRIVACY.md (no data sharing)" "$PRIVACY_MD"
+put_file ".gitignore" "chore(security): add crypto-focused .gitignore" "$GITIGNORE"
+put_file ".gitleaks.toml" "chore(security): add crypto-focused Gitleaks config" "$GITLEAKS_TOML"
+put_file ".github/CODEOWNERS" "chore(ownership): add CODEOWNERS" "$CODEOWNERS"
+put_file ".github/dependabot.yml" "chore(deps): add Dependabot" "$DEPENDABOT_YML"
+put_file ".github/workflows/codeql.yml" "ci(security): add CodeQL analysis" "$CODEQL_YML"
+put_file ".github/workflows/secret-scan.yml" "ci(security): add Gitleaks secret scan" "$SECRET_SCAN_YML"
+
+if [[ "$IS_PUBLIC" == "true" ]]; then
+  put_file ".github/workflows/scorecard.yml" "ci(security): add OpenSSF Scorecard" "$SCORECARD_YML"
+fi
+
+# =========================
+# OPEN PR VIA API
+# =========================
+say "Creating pull request ..."
+PR_JSON=$(gh api -X POST "repos/$OWNER/$REPO/pulls" \
+  -f title="Security Bootstrap: Dependabot + Secret Protection (Crypto/Wallet)" \
+  -f head="$FEATURE_BRANCH" \
+  -f base="$DEFAULT_BRANCH" \
+  -f body="Adds crypto-focused secret scanning (Gitleaks), Dependabot, CodeQL, and repo hardening. Blocks committing seed phrases, private keys, BTC WIFs, Solana arrays, and related secrets." \
+  --silent)
+PR_URL=$(printf "%s" "$PR_JSON" | jq -r .html_url)
+say "Opened PR: $PR_URL"
+
+# =========================
+# REPO SECURITY SETTINGS
+# =========================
+say "Enabling Dependabot vulnerability alerts ..."
+gh api -X PUT "repos/$OWNER/$REPO/vulnerability-alerts" -H "Accept: application/vnd.github+json" || warn "Could not enable vulnerability alerts."
+
+say "Enabling automated security fixes ..."
+gh api -X PUT "repos/$OWNER/$REPO/automated-security-fixes" -H "Accept: application/vnd.github+json" || warn "Could not enable automated security fixes."
+
+say "Enabling Secret Scanning & Push Protection (if available) ..."
+gh api -X PATCH "repos/$OWNER/$REPO" \
+  -F "security_and_analysis[secret_scanning][status]=enabled" \
+  -F "security_and_analysis[secret_scanning_push_protection][status]=enabled" || warn "Could not enable secret scanning/push protection."
+
+say "Setting merge rules (squash only, auto-delete branches) ..."
+gh api -X PATCH "repos/$OWNER/$REPO" \
+  -f allow_squash_merge=true -f allow_merge_commit=false -f allow_rebase_merge=false \
+  -f delete_branch_on_merge=true || warn "Could not update merge rules."
+
+# Branch protection
+say "Applying branch protection to '$DEFAULT_BRANCH' ..."
+REQ_CHECKS='{"strict":true,"contexts":[]}'
+if [[ "$REQUIRE_SECRET_CHECK" == "true" ]]; then
+  # Note: context must match a reported status/check name. Commonly it matches the workflow name.
+  REQ_CHECKS='{"strict":true,"contexts":["Secret Scan (Gitleaks)"]}'
+fi
+
+PROTECTION_PAYLOAD=$(jq -n --argjson checks "$REQ_CHECKS" '
+{
+  required_status_checks: $checks,
+  enforce_admins: true,
+  required_pull_request_reviews: {
+    dismiss_stale_reviews: true,
+    require_code_owner_reviews: true,
+    required_approving_review_count: 1
+  },
+  restrictions: null,
+  required_linear_history: true,
+  allow_force_pushes: false,
+  allow_deletions: false,
+  block_creations: false,
+  required_conversation_resolution: true,
+  lock_branch: false
+}
+')
+
+printf "%s" "$PROTECTION_PAYLOAD" | gh api -X PUT "repos/$OWNER/$REPO/branches/$DEFAULT_BRANCH/protection" --input - || warn "Could not set branch protection."
+
+# Require signed commits (if available)
+gh api -X POST "repos/$OWNER/$REPO/branches/$DEFAULT_BRANCH/protection/required_signatures" \
+  -H "Accept: application/vnd.github+json" >/dev/null || warn "Could not require signed commits."
+
+# No sharing settings
+say "Applying 'no sharing' settings (disable forking, discussions) ..."
+gh api -X PATCH "repos/$OWNER/$REPO" \
+  -f allow_forking=false \
+  -f has_discussions=false >/dev/null || warn "Could not update forking/discussions."
+
+if [[ "$MAKE_PRIVATE" == "true" ]]; then
+  say "Setting repository visibility to private ..."
+  gh api -X PATCH "repos/$OWNER/$REPO" -f private=true >/dev/null || warn "Could not change repository visibility."
+fi
+
+say "Done. Review and merge the PR to finalize file-based changes."
